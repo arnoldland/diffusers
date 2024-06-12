@@ -1,7 +1,7 @@
 MODEL_NAME="runwayml/stable-diffusion-v1-5"
 dataset=$1
-output_dir="result/lora_4_${dataset}"
-wandb_name="lora_4_${dataset}"
+output_dir="result/loraga_4_${dataset}"
+wandb_name="loraga_4_${dataset}"
 accelerate launch --mixed_precision="bf16" examples/text_to_image/train_text_to_image_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_data_dir="data/$dataset" \
@@ -16,3 +16,4 @@ accelerate launch --mixed_precision="bf16" examples/text_to_image/train_text_to_
   --rank=4 \
   --num_validation_images=4 \
   --wandb_name=$wandb_name \
+  --ga

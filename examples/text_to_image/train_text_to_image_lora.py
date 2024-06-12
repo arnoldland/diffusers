@@ -426,7 +426,6 @@ def parse_args():
     )
     parser.add_argument(
         "--ga",
-        type=bool,
         action="store_true",
         help=("Whether or not to use gradient approximation."),
     )
