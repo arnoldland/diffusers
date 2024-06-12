@@ -497,6 +497,12 @@ def parse_args():
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--wandb_name",
+        type=str,
+        default=None,
+        help="The name of the wandb run. If not provided, a name will be generated.",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -516,13 +522,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
             " Please use `huggingface-cli login` to authenticate with the Hub."
         )
-
     if args.non_ema_revision is not None:
         deprecate(
             "non_ema_revision!=None",
@@ -542,7 +546,10 @@ def main():
         log_with=args.report_to,
         project_config=accelerator_project_config,
     )
-
+    if args.report_to == "wandb" and accelerator.is_main_process:
+        wandb.init(project="text2image")
+        if args.wandb_name:
+            wandb.run.name = args.wandb_name
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False

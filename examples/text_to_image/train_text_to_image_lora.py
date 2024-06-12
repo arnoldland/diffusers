@@ -147,6 +147,12 @@ def log_validation(
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
+        "--wandb_name",
+        type=str,
+        default=None,
+        help="The name of the wandb run. If not provided, a name will be generated.",
+    )
+    parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
         default=None,
@@ -418,7 +424,12 @@ def parse_args():
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
-
+    parser.add_argument(
+        "--ga",
+        type=bool,
+        action="store_true",
+        help=("Whether or not to use gradient approximation."),
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -443,6 +454,7 @@ def main():
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
             " Please use `huggingface-cli login` to authenticate with the Hub."
         )
+
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -481,6 +493,10 @@ def main():
 
     # Handle the repository creation
     if accelerator.is_main_process:
+        if args.report_to == "wandb":
+            wandb.init(project="text2image")
+            if args.wandb_name:
+                wandb.run.name = args.wandb_name
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
@@ -778,6 +794,94 @@ def main():
     else:
         initial_global_step = 0
 
+    if args.ga:
+        from peft.tuners.lora.layer import Linear as LoraLinear
+        lora_modules = [m for m in unet.modules() if isinstance(m, LoraLinear)]
+        print("Enable gradient for lora layers temporarily")
+        for lora_module in lora_modules:
+            lora_module.requires_grad_(True)
+        for step, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
+            with accelerator.accumulate(unet):
+                # Convert images to latent space
+                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+
+                # Sample noise that we'll add to the latents
+                noise = torch.randn_like(latents)
+                if args.noise_offset:
+                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                    noise += args.noise_offset * torch.randn(
+                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                    )
+
+                bsz = latents.shape[0]
+                # Sample a random timestep for each image
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = timesteps.long()
+
+                # Add noise to the latents according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                # Get the text embedding for conditioning
+                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+
+                # Get the target for loss depending on the prediction type
+                if args.prediction_type is not None:
+                    # set prediction_type of scheduler if defined
+                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+                # Predict the noise residual and compute loss
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+
+                if args.snr_gamma is None:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                    # This is discussed in Section 4.2 of the same paper.
+                    snr = compute_snr(noise_scheduler, timesteps)
+                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                        dim=1
+                    )[0]
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        mse_loss_weights = mse_loss_weights / snr
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
+
+                # Backpropagate
+                accelerator.backward(loss)
+        
+        for lora_module in lora_modules:
+            # TODO: this scheme only suitable for single card
+            grads = lora_module.base_layer.weight.grad / len(train_dataloader)
+            m, n = grads.shape
+            lora_r = min(lora_module.lora_A.default.weight.shape)
+            scaling_factor = lora_module.scaling["default"]
+            U, S, V = torch.svd_lowrank(grads.to(accelerator.device).float(), q = 4 * lora_r, niter = 4)
+            V = V.T
+            B = U[:, lora_r : 2 * lora_r]/scaling_factor
+            A = V[:lora_r, :]/scaling_factor
+            lora_module.lora_B.default.weight.data = B.contiguous()
+            lora_module.lora_B.default.weight.grad = None
+            lora_module.lora_A.default.weight.data = A.contiguous()
+            lora_module.lora_A.default.weight.grad = None
+            lora_module.base_layer.weight.grad = None
+            lora_module.base_layer.weight.requires_grad_(False)
+            lora_module.base_layer.weight.data -= scaling_factor * B @ A
+
+
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -785,7 +889,6 @@ def main():
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
@@ -855,6 +958,7 @@ def main():
 
                 # Backpropagate
                 accelerator.backward(loss)
+                
                 if accelerator.sync_gradients:
                     params_to_clip = lora_layers
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
@@ -922,6 +1026,7 @@ def main():
                     revision=args.revision,
                     variant=args.variant,
                     torch_dtype=weight_dtype,
+                    safety_checker=None,
                 )
                 images = log_validation(pipeline, args, accelerator, epoch)
 
