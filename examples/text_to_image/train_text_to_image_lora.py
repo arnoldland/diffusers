@@ -43,7 +43,7 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, StableDiffusionPipeline, UNet2DConditionModel, DDIMScheduler, PNDMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import cast_training_params, compute_snr
 from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, is_wandb_available
