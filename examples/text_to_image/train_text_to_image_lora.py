@@ -429,6 +429,12 @@ def parse_args():
         action="store_true",
         help=("Whether or not to use gradient approximation."),
     )
+    parser.add_argument(
+        "--ga_steps",
+        type=int,
+        default=0,
+        help=("The number of batches to use for gradient approximation."),
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -793,13 +799,17 @@ def main():
     else:
         initial_global_step = 0
 
+    # LoRA-GA estimate gradient
     if args.ga:
         from peft.tuners.lora.layer import Linear as LoraLinear
         lora_modules = [m for m in unet.modules() if isinstance(m, LoraLinear)]
         print("Enable gradient for lora layers temporarily")
         for lora_module in lora_modules:
             lora_module.requires_grad_(True)
+        
         for step, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
+            if step > args.ga_steps:
+                break
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
@@ -863,9 +873,8 @@ def main():
                 accelerator.backward(loss)
         
         for lora_module in lora_modules:
-            # TODO: this scheme only suitable for single card
             grads = lora_module.base_layer.weight.grad / len(train_dataloader)
-            m, n = grads.shape
+            accelerator.reduce(grads, reduction="mean")
             lora_r = min(lora_module.lora_A.default.weight.shape)
             scaling_factor = lora_module.scaling["default"]
             U, S, V = torch.svd_lowrank(grads.to(accelerator.device).float(), q = 4 * lora_r, niter = 4)
@@ -879,7 +888,18 @@ def main():
             lora_module.base_layer.weight.grad = None
             lora_module.base_layer.weight.requires_grad_(False)
             lora_module.base_layer.weight.data -= scaling_factor * B @ A
-
+            
+        save_path = os.path.join(args.output_dir, f"checkpoint-orig")
+        unwrapped_unet = unwrap_model(unet)
+        unet_lora_state_dict = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(unwrapped_unet)
+        )
+        StableDiffusionPipeline.save_lora_weights(
+            save_directory=save_path,
+            unet_lora_layers=unet_lora_state_dict,
+            safe_serialization=True,
+        )
+        logger.info(f"Saved LoRA initial weights to {save_path}")
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),

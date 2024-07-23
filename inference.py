@@ -6,8 +6,20 @@ from tqdm import tqdm
 import os
 from fire import Fire
 
-def inference(ckpt_path, output_dir, metadata_path="data/coco_val/metadata.jsonl", num_processes=1):
-    pipe = StableDiffusionPipeline.from_pretrained(ckpt_path, torch_dtype=torch.float16,safety_checker=None)
+def inference(ckpt_path, output_dir, is_lora:bool, metadata_path="data/coco_val/metadata.jsonl"):
+    if is_lora:
+        pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16,safety_checker=None)
+        if os.path.exists(os.path.join(ckpt_path, "checkpoint-orig")):
+            print("LoRA-GA detected, loading original checkpoint with -1 scale")
+            pipe.load_lora_weights(os.path.join(ckpt_path, "checkpoint-orig"), adapter_name="init")
+            pipe.load_lora_weights(ckpt_path, adapter_name="final")
+            pipe.set_adapters(["init", "final"], [-1, 1])
+        else:
+            pipe.load_lora_weights(ckpt_path)
+            pipe.fuse_lora()
+        print(f"Load LoRA weights from {ckpt_path}")
+    else:
+        pipe = StableDiffusionPipeline.from_pretrained(ckpt_path, torch_dtype=torch.float16,safety_checker=None)
     distributed_state = PartialState()
     pipe.to(distributed_state.device)
     pipe.set_progress_bar_config(disable=True)

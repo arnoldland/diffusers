@@ -1,0 +1,3 @@
+/data/coco-lora-4
+FID:  17.520369892024803
+/data/coco-lora-16
